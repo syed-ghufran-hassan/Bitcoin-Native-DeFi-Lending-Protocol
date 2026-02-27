@@ -1,443 +1,356 @@
-;; Lending Pool Contract
-;; =====================
-;; CLARITY 4 FEATURES SHOWCASED:
-;; - stacks-block-time: Calculate time-based interest accrual on loans
-;; - restrict-assets?: Protect pool funds when calling external liquidation contracts
-;; - contract-hash?: Verify liquidator contracts before allowing them to execute
-;; - to-ascii?: Generate human-readable loan status messages
+;; ============================================================
+;; PRODUCTION LENDING POOL (STX-ONLY COLLATERAL)
+;; ============================================================
 
-;; Import traits
 (use-trait liquidator-trait .liquidator-trait.liquidator-trait)
 
-;; Constants
-;; Note: contract-owner should be set via set-admin after deployment
+;; ============================================================
+;; ERRORS
+;; ============================================================
+
+(define-constant ERR-OWNER-ONLY (err u400))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u401))
+(define-constant ERR-INSUFFICIENT-COLLATERAL (err u402))
+(define-constant ERR-LOAN-NOT-FOUND (err u403))
+(define-constant ERR-POSITION-HEALTHY (err u404))
+(define-constant ERR-INVALID-AMOUNT (err u405))
+(define-constant ERR-PAUSED (err u406))
+(define-constant ERR-NOT-VERIFIED (err u407))
+
+;; ============================================================
+;; PROTOCOL CONSTANTS
+;; ============================================================
+
+(define-constant COLLATERAL-RATIO u150)         ;; 150%
+(define-constant MIN-HEALTH-FACTOR u120)        ;; 120%
+(define-constant LIQUIDATION-BONUS u10)         ;; 10%
+(define-constant INTEREST-RATE-BPS u500)        ;; 5%
+
+(define-constant SECONDS-PER-YEAR u31536000)
+(define-constant BPS-DENOMINATOR u10000)
+
 (define-constant CONTRACT-ADDRESS .lending-pool)
-(define-constant err-owner-only (err u400))
-(define-constant err-insufficient-balance (err u401))
-(define-constant err-insufficient-collateral (err u402))
-(define-constant err-loan-not-found (err u403))
-(define-constant err-position-healthy (err u404))
-(define-constant err-invalid-amount (err u405))
-(define-constant err-contract-verification-failed (err u406))
-(define-constant err-asset-restriction-failed (err u407))
-(define-constant err-paused (err u408))
-(define-constant err-conversion-failed (err u409))
 
-;; Protocol Parameters
-(define-constant COLLATERAL-RATIO u150) ;; 150% = 1.5x collateralization required
-(define-constant LIQUIDATION-THRESHOLD u120) ;; 120% = liquidate below this
-(define-constant LIQUIDATION-BONUS u10) ;; 10% bonus for liquidators
-(define-constant INTEREST-RATE-BPS u500) ;; 5% annual interest (500 basis points)
-(define-constant MIN-HEALTH-FACTOR u120) ;; Minimum health factor before liquidation
+;; ============================================================
+;; STATE
+;; ============================================================
 
-;; Data Variables
+(define-data-var admin principal tx-sender)
 (define-data-var protocol-paused bool false)
+
 (define-data-var total-deposits uint u0)
 (define-data-var total-borrows uint u0)
-(define-data-var admin principal tx-sender)
 
-;; Verified liquidator contracts (using contract-hash for verification)
 (define-data-var verified-liquidator-hash (optional (buff 32)) none)
 
-;; User Data Maps
+;; ============================================================
+;; STORAGE
+;; ============================================================
+
 (define-map user-deposits
-    { user: principal }
-    {
-        amount: uint,
-        deposit-time: uint, ;; CLARITY 4: Track using stacks-block-time
-    }
+  { user: principal }
+  { amount: uint }
 )
 
 (define-map user-collateral
-    { user: principal }
-    {
-        amount: uint,
-        asset: (string-ascii 10),
-    }
+  { user: principal }
+  { amount: uint }
 )
 
 (define-map user-loans
-    { user: principal }
-    {
-        principal-amount: uint,
-        interest-accrued: uint,
-        borrow-time: uint, ;; CLARITY 4: Using stacks-block-time
-        last-interest-update: uint, ;; CLARITY 4: Track last interest calculation
-    }
+  { user: principal }
+  {
+    principal-amount: uint,
+    borrow-time: uint,
+    last-interest-update: uint,
+  }
 )
 
-;; CLARITY 4 FEATURE: contract-hash?
-;; Verify and register a liquidator contract
-(define-public (register-verified-liquidator (liquidator principal))
-    (begin
-        (asserts! (is-eq tx-sender (var-get admin)) err-owner-only)
+;; ============================================================
+;; INTERNAL HELPERS
+;; ============================================================
 
-        ;; CLARITY 4: Get the hash of the liquidator contract's code
-        ;; This ensures we only interact with verified, audited liquidation logic
-        (match (contract-hash? liquidator)
-            hash-value
-                (begin
-                    (var-set verified-liquidator-hash (some hash-value))
-                    (ok hash-value)
-                )
-            err
-                err-contract-verification-failed
-        )
-    )
+(define-private (assert-not-paused)
+  (asserts! (not (var-get protocol-paused)) ERR-PAUSED)
 )
 
-;; Verify a liquidator contract before allowing it to execute
-(define-private (is-liquidator-verified (liquidator principal))
-    (match (var-get verified-liquidator-hash)
-        expected-hash
-            (match (contract-hash? liquidator)
-                current-hash
-                    (is-eq current-hash expected-hash)
-                err
-                    false
-            )
-        false
-    )
+(define-private (get-available-liquidity)
+  (- (var-get total-deposits) (var-get total-borrows))
 )
 
-;; Deposit STX into the pool
-(define-public (deposit (amount uint))
-    (let ((current-deposit (default-to {
-            amount: u0,
-            deposit-time: stacks-block-time,
-        }
-            (map-get? user-deposits { user: tx-sender })
-        )))
-        (asserts! (not (var-get protocol-paused)) err-paused)
-        (asserts! (> amount u0) err-invalid-amount)
+;; ------------------------------------------------------------
+;; Interest Calculation
+;; ------------------------------------------------------------
 
-        ;; Transfer STX to contract
-        (try! (stx-transfer? amount tx-sender CONTRACT-ADDRESS))
-
-        ;; CLARITY 4: Update deposit with current stacks-block-time
-        (map-set user-deposits { user: tx-sender } {
-            amount: (+ (get amount current-deposit) amount),
-            deposit-time: stacks-block-time,
-        })
-
-        ;; Update total deposits
-        (var-set total-deposits (+ (var-get total-deposits) amount))
-
-        (ok true)
-    )
-)
-
-;; Withdraw STX from the pool
-(define-public (withdraw (amount uint))
-    (let (
-            (user-deposit (unwrap! (map-get? user-deposits { user: tx-sender })
-                err-insufficient-balance
-            ))
-            (recipient tx-sender)
-        )
-        (asserts! (not (var-get protocol-paused)) err-paused)
-        (asserts! (>= (get amount user-deposit) amount) err-insufficient-balance)
-
-        ;; Update user deposit
-        (map-set user-deposits { user: tx-sender } {
-            amount: (- (get amount user-deposit) amount),
-            deposit-time: (get deposit-time user-deposit),
-        })
-
-        ;; Transfer STX back to user from contract
-        (try! (stx-transfer? amount CONTRACT-ADDRESS recipient))
-
-        ;; Update total deposits
-        (var-set total-deposits (- (var-get total-deposits) amount))
-
-        (ok true)
-    )
-)
-
-;; CLARITY 4 FEATURE: stacks-block-time
-;; Calculate accrued interest based on time elapsed
 (define-read-only (calculate-current-interest (user principal))
-    (match (map-get? user-loans { user: user })
-        loan-data (let (
-                ;; CLARITY 4: Use stacks-block-time for precise time-based calculations
-                (last-update (get last-interest-update loan-data))
-                (time-elapsed (if (> stacks-block-time last-update)
-                    (- stacks-block-time last-update)
-                    u0
-                ))
-                (principal-amt (get principal-amount loan-data))
-                ;; Calculate interest: (principal * rate * time) / (seconds-per-year * 10000)
-                (new-interest (if (> time-elapsed u0)
-                    (/ (* (* principal-amt INTEREST-RATE-BPS) time-elapsed)
-                        u315360000000
-                    )
-                    u0
-                ))
-            )
-            (ok (+ (get interest-accrued loan-data) new-interest))
+  (match (map-get? user-loans { user: user })
+    loan
+      (let (
+        (elapsed (if (> stacks-block-time (get last-interest-update loan))
+                    (- stacks-block-time (get last-interest-update loan))
+                    u0))
+      )
+        (ok
+          (/ (* (* (get principal-amount loan) INTEREST-RATE-BPS) elapsed)
+             (* SECONDS-PER-YEAR BPS-DENOMINATOR)
+          )
         )
-        (ok u0)
-    )
+      )
+    (ok u0)
+  )
 )
 
-;; Borrow against collateral
+(define-private (accrue-interest (user principal))
+  (match (map-get? user-loans { user: user })
+    loan
+      (let (
+        (interest (unwrap-panic (calculate-current-interest user)))
+        (new-principal (+ (get principal-amount loan) interest))
+      )
+        (map-set user-loans { user: user } {
+          principal-amount: new-principal,
+          borrow-time: (get borrow-time loan),
+          last-interest-update: stacks-block-time,
+        })
+        (var-set total-borrows (+ (var-get total-borrows) interest))
+        interest
+      )
+    u0
+  )
+)
+
+;; ------------------------------------------------------------
+;; Health Factor
+;; ------------------------------------------------------------
+
+(define-private (calculate-health-factor (user principal))
+  (match (map-get? user-loans { user: user })
+    loan
+      (match (map-get? user-collateral { user: user })
+        coll
+          (let (
+            (interest (unwrap-panic (calculate-current-interest user)))
+            (total-debt (+ (get principal-amount loan) interest))
+          )
+            (if (is-eq total-debt u0)
+                u0
+                (/ (* (get amount coll) u100) total-debt)
+            )
+          )
+        u0
+      )
+    u0
+  )
+)
+
+;; ============================================================
+;; DEPOSIT / WITHDRAW
+;; ============================================================
+
+(define-public (deposit (amount uint))
+  (begin
+    (assert-not-paused)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+
+    (try! (stx-transfer? amount tx-sender CONTRACT-ADDRESS))
+
+    (let ((current (default-to { amount: u0 }
+                    (map-get? user-deposits { user: tx-sender }))))
+      (map-set user-deposits { user: tx-sender } {
+        amount: (+ (get amount current) amount)
+      })
+    )
+
+    (var-set total-deposits (+ (var-get total-deposits) amount))
+    (ok true)
+  )
+)
+
+(define-public (withdraw (amount uint))
+  (let ((deposit (unwrap! (map-get? user-deposits { user: tx-sender })
+                 ERR-INSUFFICIENT-BALANCE)))
+    (assert-not-paused)
+    (asserts! (>= (get amount deposit) amount)
+              ERR-INSUFFICIENT-BALANCE)
+
+    (map-set user-deposits { user: tx-sender } {
+      amount: (- (get amount deposit) amount)
+    })
+
+    (try! (stx-transfer? amount CONTRACT-ADDRESS tx-sender))
+    (var-set total-deposits (- (var-get total-deposits) amount))
+
+    (ok true)
+  )
+)
+
+;; ============================================================
+;; COLLATERAL
+;; ============================================================
+
+(define-public (add-collateral (amount uint))
+  (begin
+    (assert-not-paused)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+
+    (try! (stx-transfer? amount tx-sender CONTRACT-ADDRESS))
+
+    (let ((current (default-to { amount: u0 }
+                    (map-get? user-collateral { user: tx-sender }))))
+      (map-set user-collateral { user: tx-sender } {
+        amount: (+ (get amount current) amount)
+      })
+    )
+
+    (ok true)
+  )
+)
+
+;; ============================================================
+;; BORROW / REPAY
+;; ============================================================
+
 (define-public (borrow (amount uint))
+  (let (
+        (coll (unwrap! (map-get? user-collateral { user: tx-sender })
+               ERR-INSUFFICIENT-COLLATERAL))
+      )
+    (assert-not-paused)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+
+    (accrue-interest tx-sender)
+
     (let (
-            (recipient tx-sender)
-            (user-coll (unwrap! (map-get? user-collateral { user: tx-sender })
-                err-insufficient-collateral
-            ))
-            (current-collateral (get amount user-coll))
-            (max-borrow (/ (* current-collateral u100) COLLATERAL-RATIO))
-            (existing-loan (map-get? user-loans { user: tx-sender }))
-            (current-debt (match existing-loan
-                loan (+ (get principal-amount loan)
-                    (unwrap-panic (calculate-current-interest tx-sender))
-                )
-                u0
-            ))
+          (loan (map-get? user-loans { user: tx-sender }))
+          (existing (match loan l (get principal-amount l) u0))
+          (new-debt (+ existing amount))
+          (max-borrow (/ (* (get amount coll) u100) COLLATERAL-RATIO))
         )
-        (asserts! (not (var-get protocol-paused)) err-paused)
-        (asserts! (<= (+ current-debt amount) max-borrow)
-            err-insufficient-collateral
-        )
+      (asserts! (<= new-debt max-borrow)
+                ERR-INSUFFICIENT-COLLATERAL)
+      (asserts! (>= (get-available-liquidity) amount)
+                ERR-INSUFFICIENT-BALANCE)
 
-        ;; CLARITY 4: Create/update loan with stacks-block-time timestamp
-        ;; If existing loan, preserve original borrow-time, otherwise use current time
-        (let ((original-borrow-time (match existing-loan
-                loan (get borrow-time loan)
-                stacks-block-time
-            )))
-            (map-set user-loans { user: tx-sender } {
-                principal-amount: (+ current-debt amount),
-                interest-accrued: u0, ;; Interest is now part of principal
-                borrow-time: original-borrow-time,
-                last-interest-update: stacks-block-time,
-            })
-        )
+      (map-set user-loans { user: tx-sender } {
+        principal-amount: new-debt,
+        borrow-time: stacks-block-time,
+        last-interest-update: stacks-block-time,
+      })
 
-        ;; Transfer borrowed amount from contract
-        (try! (stx-transfer? amount CONTRACT-ADDRESS recipient))
+      (try! (stx-transfer? amount CONTRACT-ADDRESS tx-sender))
+      (var-set total-borrows (+ (var-get total-borrows) amount))
 
-        ;; Update total borrows
-        (var-set total-borrows (+ (var-get total-borrows) amount))
-
-        (ok true)
+      (ok true)
     )
+  )
 )
 
-;; Add collateral to enable borrowing
-(define-public (add-collateral
-        (amount uint)
-        (asset (string-ascii 10))
-    )
-    (let ((current-coll (default-to {
-            amount: u0,
-            asset: "STX",
-        }
-            (map-get? user-collateral { user: tx-sender })
-        )))
-        (asserts! (not (var-get protocol-paused)) err-paused)
-        (asserts! (> amount u0) err-invalid-amount)
-
-        ;; Transfer collateral to contract
-        (try! (stx-transfer? amount tx-sender CONTRACT-ADDRESS))
-
-        ;; Update collateral
-        (map-set user-collateral { user: tx-sender } {
-            amount: (+ (get amount current-coll) amount),
-            asset: asset,
-        })
-
-        (ok true)
-    )
-)
-
-;; Repay loan
 (define-public (repay (amount uint))
+  (let ((loan (unwrap! (map-get? user-loans { user: tx-sender })
+             ERR-LOAN-NOT-FOUND)))
+    (assert-not-paused)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+
     (let (
-            (loan-data (unwrap! (map-get? user-loans { user: tx-sender }) err-loan-not-found))
-            (current-interest (unwrap-panic (calculate-current-interest tx-sender)))
-            (total-debt (+ (get principal-amount loan-data) current-interest))
+          (interest (accrue-interest tx-sender))
+          (updated-loan (unwrap-panic
+            (map-get? user-loans { user: tx-sender })))
+          (total-debt (get principal-amount updated-loan))
         )
-        (asserts! (not (var-get protocol-paused)) err-paused)
-        (asserts! (<= amount total-debt) err-invalid-amount)
+      (asserts! (<= amount total-debt) ERR-INVALID-AMOUNT)
 
-        ;; Transfer repayment
-        (try! (stx-transfer? amount tx-sender CONTRACT-ADDRESS))
+      (try! (stx-transfer? amount tx-sender CONTRACT-ADDRESS))
 
-        ;; Update loan
-        (if (>= amount total-debt)
-            ;; Full repayment - delete loan
-            (begin
-                (map-delete user-loans { user: tx-sender })
-                (var-set total-borrows (- (var-get total-borrows) total-debt))
-            )
-            ;; Partial repayment - update loan
-            (begin
-                (map-set user-loans { user: tx-sender } {
-                    principal-amount: (- total-debt amount),
-                    interest-accrued: u0,
-                    borrow-time: (get borrow-time loan-data),
-                    last-interest-update: stacks-block-time,
-                })
-                (var-set total-borrows (- (var-get total-borrows) amount))
-            )
-        )
-
-        (ok true)
-    )
-)
-
-;; CLARITY 4 FEATURES: restrict-assets? and contract-hash?
-;; Liquidate undercollateralized position with asset protection
-(define-public (liquidate
-        (borrower principal)
-        (liquidator <liquidator-trait>)
-    )
-    (let (
-            (loan-data (unwrap! (map-get? user-loans { user: borrower }) err-loan-not-found))
-            (collateral-data (unwrap! (map-get? user-collateral { user: borrower })
-                err-loan-not-found
-            ))
-            (total-debt (+ (get principal-amount loan-data)
-                (unwrap-panic (calculate-current-interest borrower))
-            ))
-            (collateral-value (get amount collateral-data))
-            (health-factor (if (is-eq total-debt u0)
-                u0
-                (/ (* collateral-value u100) total-debt)
-            ))
-            (liquidation-amount (+ total-debt (/ (* total-debt LIQUIDATION-BONUS) u100)))
-        )
-        (asserts! (not (var-get protocol-paused)) err-paused)
-
-        ;; Check if position is unhealthy
-        (asserts! (< health-factor MIN-HEALTH-FACTOR) err-position-healthy)
-
-        ;; CLARITY 4: Verify liquidator contract using contract-hash?
-        (asserts! (is-liquidator-verified (contract-of liquidator))
-            err-contract-verification-failed
-        )
-
-        ;; CLARITY 4: Use restrict-assets? to protect pool funds
-        ;; This ensures the liquidator can only move the specified amount
-        ;; Note: restrict-assets? sets post-conditions that automatically enforce limits
-        (let (
-                (liquidator-contract (contract-of liquidator))
-            )
-            ;; Set asset restrictions - this will automatically revert if liquidator
-            ;; tries to move more STX than liquidation-amount
-            ;; Note: Actual implementation depends on Clarity 4 final specification
-            ;; For now, we validate manually before and after the call
-            (asserts! (<= liquidation-amount collateral-value) err-asset-restriction-failed)
-
-            ;; Call liquidator with asset restrictions in place
-            (try! (contract-call? liquidator liquidate borrower total-debt))
-
-            ;; Transfer collateral to liquidator (with bonus)
-            (try! (stx-transfer? liquidation-amount CONTRACT-ADDRESS (contract-of liquidator)))
-
-            ;; Clear borrower's loan
-            (map-delete user-loans { user: borrower })
-
-            ;; Clear borrower's collateral
-            (map-delete user-collateral { user: borrower })
-
-            ;; Update total borrows
+      (if (>= amount total-debt)
+          (begin
+            (map-delete user-loans { user: tx-sender })
             (var-set total-borrows (- (var-get total-borrows) total-debt))
-
-            (ok true)
-        )
-    )
-)
-
-;; Calculate health factor for a user
-(define-read-only (get-health-factor (user principal))
-    (match (map-get? user-loans { user: user })
-        loan-data (match (map-get? user-collateral { user: user })
-            coll-data (let (
-                    (total-debt (+ (get principal-amount loan-data)
-                        (unwrap-panic (calculate-current-interest user))
-                    ))
-                    (collateral-value (get amount coll-data))
-                )
-                (if (is-eq total-debt u0)
-                    (ok u0)
-                    (ok (/ (* collateral-value u100) total-debt))
-                )
-            )
-            (ok u0)
-        )
-        (ok u0)
-    )
-)
-
-;; CLARITY 4 FEATURE: to-ascii? for loan status
-;; Get human-readable loan status
-(define-read-only (get-loan-status-ascii (user principal))
-    (match (map-get? user-loans { user: user })
-        loan-data (let (
-                (principal-amt (get principal-amount loan-data))
-                (interest-amt (unwrap-panic (calculate-current-interest user)))
-                (health (unwrap-panic (get-health-factor user)))
-                (principal-ascii (unwrap! (to-ascii? principal-amt) "0"))
-                (interest-ascii (unwrap! (to-ascii? interest-amt) "0"))
-                (health-ascii (unwrap! (to-ascii? health) "0"))
-            )
-            (ok {
-                principal: principal-ascii,
-                interest: interest-ascii,
-                health-factor: health-ascii,
-                status: (if (< health MIN-HEALTH-FACTOR)
-                    "LIQUIDATABLE"
-                    "HEALTHY"
-                ),
+          )
+          (begin
+            (map-set user-loans { user: tx-sender } {
+              principal-amount: (- total-debt amount),
+              borrow-time: (get borrow-time updated-loan),
+              last-interest-update: stacks-block-time,
             })
+            (var-set total-borrows (- (var-get total-borrows) amount))
+          )
+      )
+
+      (ok true)
+    )
+  )
+)
+
+;; ============================================================
+;; LIQUIDATION
+;; ============================================================
+
+(define-public (liquidate
+  (borrower principal)
+  (liquidator <liquidator-trait>)
+)
+  (begin
+    (assert-not-paused)
+
+    (asserts!
+      (is-eq true
+        (match (var-get verified-liquidator-hash)
+          expected
+            (match (contract-hash? (contract-of liquidator))
+              current (is-eq current expected)
+              false)
+          false))
+      ERR-NOT-VERIFIED)
+
+    (let (
+          (loan (unwrap! (map-get? user-loans { user: borrower })
+                 ERR-LOAN-NOT-FOUND))
+          (coll (unwrap! (map-get? user-collateral { user: borrower })
+                 ERR-LOAN-NOT-FOUND))
+          (interest (unwrap-panic (calculate-current-interest borrower)))
+          (total-debt (+ (get principal-amount loan) interest))
+          (health (calculate-health-factor borrower))
         )
-        (ok {
-            principal: "0",
-            interest: "0",
-            health-factor: "0",
-            status: "NO_LOAN",
-        })
-    )
-)
+      (asserts! (< health MIN-HEALTH-FACTOR)
+                ERR-POSITION-HEALTHY)
 
-;; Read-only functions
-(define-read-only (get-user-deposit (user principal))
-    (ok (map-get? user-deposits { user: user }))
-)
+      (let ((liquidation-amount
+              (min
+                (+ total-debt
+                   (/ (* total-debt LIQUIDATION-BONUS) u100))
+                (get amount coll)
+              )))
+        (try! (contract-call? liquidator liquidate borrower total-debt))
+        (try! (stx-transfer? liquidation-amount CONTRACT-ADDRESS
+                             (contract-of liquidator)))
 
-(define-read-only (get-user-collateral (user principal))
-    (ok (map-get? user-collateral { user: user }))
-)
+        (map-delete user-loans { user: borrower })
+        (map-delete user-collateral { user: borrower })
 
-(define-read-only (get-user-loan (user principal))
-    (ok (map-get? user-loans { user: user }))
-)
+        (var-set total-borrows (- (var-get total-borrows) total-debt))
 
-(define-read-only (get-total-deposits)
-    (ok (var-get total-deposits))
-)
-
-(define-read-only (get-total-borrows)
-    (ok (var-get total-borrows))
-)
-
-;; Admin functions
-(define-public (set-paused (paused bool))
-    (begin
-        (asserts! (is-eq tx-sender (var-get admin)) err-owner-only)
-        (var-set protocol-paused paused)
         (ok true)
+      )
     )
+  )
 )
+
+;; ============================================================
+;; ADMIN
+;; ============================================================
 
 (define-public (set-admin (new-admin principal))
-    (begin
-        (asserts! (is-eq tx-sender (var-get admin)) err-owner-only)
-        (var-set admin new-admin)
-        (ok true)
-    )
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-OWNER-ONLY)
+    (var-set admin new-admin)
+    (ok true)
+  )
+)
+
+(define-public (set-paused (paused bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get admin)) ERR-OWNER-ONLY)
+    (var-set protocol-paused paused)
+    (ok true)
+  )
 )
